@@ -1,81 +1,90 @@
-import psycopg2
+import hashlib
+import sys
 from pathlib import Path
-from parse.structured.st37_parser import parse_st37, WellLicence
+import psycopg
+from parse.structured.licence_parser import parse_licences
 
-def load_well_licences(filepath: Path, checksum: str) -> int:
-    """Load well licences into the database"""
-    # Parse the file
-    licences = parse_st37(filepath)
-    
-    # Connect to database
-    conn = psycopg2.connect(
-        host="localhost",
-        user="rip",
-        password="rip",
-        database="rip"
-    )
-    cursor = conn.cursor()
-    
-    # Insert raw file record
-    cursor.execute("""
-        INSERT INTO raw_files (source, filename, checksum)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (source, checksum) DO NOTHING
-        RETURNING id
-    """, ("st37", filepath.name, checksum))
-    
-    result = cursor.fetchone()
-    if result:
-        raw_file_id = result[0]
-        
-        # Insert well licences
-        for licence in licences:
-            cursor.execute("""
-                INSERT INTO wells (
-                    licence_no, status, uwi, well_name, operator,
-                    licence_date, spud_date, rig_release_date, well_type,
-                    field, pool, latitude, longitude, ground_elevation,
-                    kb_elevation, td_depth, td_formation, raw_file_id
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (licence_no) DO UPDATE
-                SET status = EXCLUDED.status,
-                    uwi = EXCLUDED.uwi,
-                    well_name = EXCLUDED.well_name,
-                    operator = EXCLUDED.operator,
-                    spud_date = EXCLUDED.spud_date,
-                    rig_release_date = EXCLUDED.rig_release_date,
-                    well_type = EXCLUDED.well_type,
-                    field = EXCLUDED.field,
-                    pool = EXCLUDED.pool,
-                    latitude = EXCLUDED.latitude,
-                    longitude = EXCLUDED.longitude,
-                    ground_elevation = EXCLUDED.ground_elevation,
-                    kb_elevation = EXCLUDED.kb_elevation,
-                    td_depth = EXCLUDED.td_depth,
-                    td_formation = EXCLUDED.td_formation,
-                    raw_file_id = EXCLUDED.raw_file_id,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (
-                licence.licence_no, licence.status, licence.uwi, licence.well_name,
-                licence.operator, licence.licence_date, licence.spud_date,
-                licence.rig_release_date, licence.well_type, licence.field,
-                licence.pool, licence.latitude, licence.longitude,
-                licence.ground_elevation, licence.kb_elevation,
-                licence.td_depth, licence.td_formation, raw_file_id
-            ))
-        
-        conn.commit()
-        print(f"Loaded {len(licences)} well licences into database")
-    else:
-        print("File already processed")
-    
-    conn.close()
-    return len(licences) if result else 0
+DSN = "postgresql://rip:rip@localhost:5432/rip"
+
+COLS = ("licence_no, company_name, latitude, longitude, surface_location, "
+        "category_type, rating_level, status, status_date, non_routine, "
+        "non_routine_status, raw_file_id")
+
+EVENTS = [
+    ("new_licence", """
+        INSERT INTO licence_events (licence_no, event_type, new_value, raw_file_id)
+        SELECT s.licence_no, 'new_licence', s.status, s.raw_file_id
+        FROM staging s LEFT JOIN licences l ON l.licence_no = s.licence_no
+        WHERE l.licence_no IS NULL"""),
+    ("status_change", """
+        INSERT INTO licence_events (licence_no, event_type, old_value, new_value, raw_file_id)
+        SELECT s.licence_no, 'status_change', l.status, s.status, s.raw_file_id
+        FROM staging s JOIN licences l ON l.licence_no = s.licence_no
+        WHERE s.status IS DISTINCT FROM l.status"""),
+    ("operator_change", """
+        INSERT INTO licence_events (licence_no, event_type, old_value, new_value, raw_file_id)
+        SELECT s.licence_no, 'operator_change', l.company_name, s.company_name, s.raw_file_id
+        FROM staging s JOIN licences l ON l.licence_no = s.licence_no
+        WHERE s.company_name IS DISTINCT FROM l.company_name"""),
+]
+
+UPSERT = f"""
+INSERT INTO licences ({COLS})
+SELECT DISTINCT ON (licence_no) {COLS} FROM staging
+ON CONFLICT (licence_no) DO UPDATE SET
+  company_name=EXCLUDED.company_name, latitude=EXCLUDED.latitude,
+  longitude=EXCLUDED.longitude, surface_location=EXCLUDED.surface_location,
+  category_type=EXCLUDED.category_type, rating_level=EXCLUDED.rating_level,
+  status=EXCLUDED.status, status_date=EXCLUDED.status_date,
+  non_routine=EXCLUDED.non_routine, non_routine_status=EXCLUDED.non_routine_status,
+  raw_file_id=EXCLUDED.raw_file_id, updated_at=CURRENT_TIMESTAMP
+"""
+
+
+def sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load(path: Path, source: str = "well_licences") -> int:
+    checksum = sha256(path)
+    with psycopg.connect(DSN) as conn:
+        row = conn.execute(
+            "INSERT INTO raw_files (source, filename, checksum) VALUES (%s,%s,%s) "
+            "ON CONFLICT (source, checksum) DO NOTHING RETURNING id",
+            (source, path.name, checksum),
+        ).fetchone()
+        if row is None:
+            print("File already processed")
+            return 0
+        raw_id = row[0]
+        had_data = conn.execute("SELECT EXISTS (SELECT 1 FROM licences)").fetchone()[0]
+
+        conn.execute("CREATE TEMP TABLE staging (LIKE licences) ON COMMIT DROP")
+        total = 0
+        with conn.cursor() as cur:
+            with cur.copy(f"COPY staging ({COLS}) FROM STDIN") as cp:
+                for l in parse_licences(path):
+                    cp.write_row((l.licence_no, l.company_name, l.latitude,
+                                  l.longitude, l.surface_location, l.category_type,
+                                  l.rating_level, l.status, l.status_date,
+                                  l.non_routine, l.non_routine_status, raw_id))
+                    total += 1
+
+        if had_data:
+            for name, sql in EVENTS:
+                n = conn.execute(sql).rowcount
+                print(f"{name}: {n}")
+        else:
+            print("First load, no events emitted")
+
+        conn.execute(UPSERT)
+        print(f"Loaded {total} licences")
+        return total
+
 
 if __name__ == "__main__":
-    from pathlib import Path
-    filepath = Path("raw/st37/sample_well_licences.csv")
-    checksum = "sample_checksum"
-    count = load_well_licences(filepath, checksum)
-    print(f"Processed {count} records")
+    load(Path(sys.argv[1]))
