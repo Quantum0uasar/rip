@@ -10,7 +10,6 @@ venv/
 ENV/
 
 # Docker
-docker-compose.yml
 .docker/
 
 # Environment
