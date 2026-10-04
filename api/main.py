@@ -71,4 +71,10 @@ def events(type: str = "", limit: int = Query(50, le=200)):
     return {"rows": rows}
 
 
+@app.get("/api/health")
+def health():
+    run("SELECT 1")
+    return {"ok": True}
+
+
 app.mount("/", StaticFiles(directory="web", html=True), name="web")
