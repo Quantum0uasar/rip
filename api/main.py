@@ -1,10 +1,11 @@
+import os
 from datetime import timezone
 import psycopg
 from psycopg.rows import dict_row
 from fastapi import FastAPI, Query
 from fastapi.staticfiles import StaticFiles
 
-DSN = "postgresql://rip:rip@localhost:5432/rip"
+DSN = os.environ.get("RIP_DSN", "postgresql://rip:rip@localhost:5432/rip")
 app = FastAPI(title="RIP API")
 
 

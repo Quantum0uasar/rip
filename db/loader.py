@@ -1,10 +1,11 @@
+import os
 import hashlib
 import sys
 from pathlib import Path
 import psycopg
 from parse.structured.licence_parser import parse_licences
 
-DSN = "postgresql://rip:rip@localhost:5432/rip"
+DSN = os.environ.get("RIP_DSN", "postgresql://rip:rip@localhost:5432/rip")
 
 COLS = ("licence_no, company_name, latitude, longitude, surface_location, "
         "category_type, rating_level, status, status_date, non_routine, "
